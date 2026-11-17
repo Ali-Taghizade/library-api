@@ -7,7 +7,7 @@ import loan_repository
 import member_repository
 import notifications
 import validation
-from errors import bad_request, conflict, not_found
+from checks import ensure, ensure_fields, ensure_found, ensure_valid
 
 LOAN_DAYS = 14
 MAX_RENEWALS = 1
@@ -51,32 +51,21 @@ def list_loans(only_overdue):
 
 
 def get_loan(loan_id):
-    loan = loan_repository.get_loan(loan_id)
-    if loan is None:
-        raise not_found("loan not found")
-    return loan
+    return ensure_found(loan_repository.get_loan(loan_id), "loan not found")
 
 
 def create_loan(data):
-    if not data.get("book_id") or not data.get("member_id"):
-        raise bad_request("book_id and member_id are required")
-    if data.get("due_date") and not validation.is_valid_date(data["due_date"]):
-        raise bad_request("invalid due_date")
+    ensure_fields(data, ["book_id", "member_id"], "book_id and member_id are required")
+    if data.get("due_date"):
+        ensure_valid(validation.is_valid_date(data["due_date"]), "invalid due_date")
 
-    book = book_repository.get_book(data["book_id"])
-    if book is None:
-        raise not_found("book not found")
-    member = member_repository.get_member(data["member_id"])
-    if member is None:
-        raise not_found("member not found")
-    if not book["available"]:
-        raise conflict("book is not available")
+    book = ensure_found(book_repository.get_book(data["book_id"]), "book not found")
+    member = ensure_found(member_repository.get_member(data["member_id"]), "member not found")
+    ensure(book["available"], "book is not available")
 
     member_loans = loan_repository.list_loans_for_member(member["id"])
-    if total_owed(member_loans) > 0:
-        raise conflict("member has unpaid fines")
-    if count_open_loans(member_loans) >= loan_limit(member["type"]):
-        raise conflict("loan limit reached")
+    ensure(total_owed(member_loans) == 0, "member has unpaid fines")
+    ensure(count_open_loans(member_loans) < loan_limit(member["type"]), "loan limit reached")
 
     today = date.today()
     due_date = data.get("due_date") or (today + timedelta(days=LOAN_DAYS)).isoformat()
@@ -87,8 +76,7 @@ def create_loan(data):
 
 def return_book(loan_id):
     loan = get_loan(loan_id)
-    if loan["returned"]:
-        raise conflict("loan already returned")
+    ensure(not loan["returned"], "loan already returned")
 
     fine = fines.late_fine(loan["due_date"])
     updated = loan_repository.mark_returned(loan_id, loan["book_id"], fine)
@@ -102,12 +90,9 @@ def return_book(loan_id):
 
 def renew_loan(loan_id):
     loan = get_loan(loan_id)
-    if loan["returned"]:
-        raise conflict("loan already returned")
-    if fines.is_overdue(loan["due_date"]):
-        raise conflict("overdue loans cannot be renewed")
-    if loan["renewals"] >= MAX_RENEWALS:
-        raise conflict("loan was already renewed")
+    ensure(not loan["returned"], "loan already returned")
+    ensure(not fines.is_overdue(loan["due_date"]), "overdue loans cannot be renewed")
+    ensure(loan["renewals"] < MAX_RENEWALS, "loan was already renewed")
 
     new_due = (date.fromisoformat(loan["due_date"]) + timedelta(days=LOAN_DAYS)).isoformat()
     updated = loan_repository.extend_loan(loan_id, new_due)

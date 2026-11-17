@@ -3,7 +3,7 @@ import loan_repository
 import loan_service
 import member_repository
 import validation
-from errors import bad_request, conflict, not_found
+from checks import ensure, ensure_fields, ensure_found, ensure_valid
 
 
 def list_members():
@@ -11,22 +11,15 @@ def list_members():
 
 
 def get_member(member_id):
-    member = member_repository.get_member(member_id)
-    if member is None:
-        raise not_found("member not found")
-    return member
+    return ensure_found(member_repository.get_member(member_id), "member not found")
 
 
 def create_member(data):
-    if not data.get("name"):
-        raise bad_request("name is required")
-    if not validation.is_valid_email(data.get("email")):
-        raise bad_request("invalid email")
+    ensure_fields(data, ["name"], "name is required")
+    ensure_valid(validation.is_valid_email(data.get("email")), "invalid email")
     member_type = data.get("type", "student")
-    if not validation.is_valid_member_type(member_type):
-        raise bad_request("type must be student or staff")
-    if member_repository.get_member_by_email(data["email"]) is not None:
-        raise conflict("email already registered")
+    ensure_valid(validation.is_valid_member_type(member_type), "type must be student or staff")
+    ensure(member_repository.get_member_by_email(data["email"]) is None, "email already registered")
     return member_repository.create_member(data["name"], data["email"], member_type)
 
 
