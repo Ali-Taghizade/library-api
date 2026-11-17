@@ -2,23 +2,9 @@
 from flask import Blueprint, jsonify
 
 import fine_service
-import fines
+from loan_routes import loan_json
 
 bp = Blueprint("fines", __name__)
-
-
-def loan_json(loan):
-    return {
-        "id": loan["id"],
-        "book_id": loan["book_id"],
-        "member_id": loan["member_id"],
-        "due_date": loan["due_date"],
-        "returned": bool(loan["returned"]),
-        "fine": fines.money(loan["fine"]),
-        "fine_paid": bool(loan["fine_paid"]),
-        "renewals": loan["renewals"],
-        "checked_out": loan["checked_out"],
-    }
 
 
 @bp.route("/loans/<int:loan_id>/pay-fine", methods=["POST"])
