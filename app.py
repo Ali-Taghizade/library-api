@@ -4,14 +4,16 @@ from datetime import date, timedelta
 from flask import Flask, jsonify, request
 
 import book_routes
+import fine_routes
 import db
 from db import init_db
 from errors import LibraryError
-from fines import balance_owed, days_late, late_fine
+import fines
 from validation import is_valid_date, is_valid_email, is_valid_member_type
 
 app = Flask(__name__)
 app.register_blueprint(book_routes.bp)
+app.register_blueprint(fine_routes.bp)
 
 
 @app.errorhandler(LibraryError)
@@ -23,10 +25,6 @@ CURRENT_MEMBER = None
 
 
 # ---------- helpers ----------
-
-
-def money(x):
-    return round(float(x), 2)
 
 
 def notify(kind, title="", send=True):
@@ -109,14 +107,14 @@ def member_loans(member_id):
     for loan in rows:
         if loan[4] == 0:
             open_loans += 1
-        owed += balance_owed(loan[3], loan[4], loan[5], loan[6])
+        owed += fines.balance_owed(loan[3], loan[4], loan[5], loan[6])
         loans.append(
             {
                 "id": loan[0],
                 "book_id": loan[1],
                 "due_date": loan[3],
                 "returned": bool(loan[4]),
-                "fine": money(loan[5]),
+                "fine": fines.money(loan[5]),
                 "fine_paid": bool(loan[6]),
             }
         )
@@ -124,7 +122,7 @@ def member_loans(member_id):
         remaining = 5 - open_loans
     else:
         remaining = 3 - open_loans
-    return jsonify({"loans": loans, "total_owed": money(owed), "loans_remaining": remaining})
+    return jsonify({"loans": loans, "total_owed": fines.money(owed), "loans_remaining": remaining})
 
 
 # ---------- loans ----------
@@ -137,10 +135,8 @@ def list_loans():
     conn.close()
     result = []
     for loan in rows:
-        current_fine = loan[5]
-        if loan[4] == 0:
-            current_fine = late_fine(loan[3])
-        if request.args.get("overdue") == "true" and (loan[4] == 1 or days_late(loan[3]) <= 0):
+        current_fine = fines.current_fine(loan[3], loan[4], loan[5])
+        if request.args.get("overdue") == "true" and (loan[4] == 1 or not fines.is_overdue(loan[3])):
             continue
         result.append(
             {
@@ -149,11 +145,11 @@ def list_loans():
                 "member_id": loan[2],
                 "due_date": loan[3],
                 "returned": bool(loan[4]),
-                "fine": money(loan[5]),
+                "fine": fines.money(loan[5]),
                 "fine_paid": bool(loan[6]),
                 "renewals": loan[7],
                 "checked_out": loan[8],
-                "current_fine": money(current_fine),
+                "current_fine": fines.money(current_fine),
             }
         )
     return jsonify(result)
@@ -166,9 +162,7 @@ def get_loan(loan_id):
     conn.close()
     if loan is None:
         return jsonify({"error": "loan not found"}), 404
-    current_fine = loan[5]
-    if loan[4] == 0:
-        current_fine = late_fine(loan[3])
+    current_fine = fines.current_fine(loan[3], loan[4], loan[5])
     return jsonify(
         {
             "id": loan[0],
@@ -176,11 +170,11 @@ def get_loan(loan_id):
             "member_id": loan[2],
             "due_date": loan[3],
             "returned": bool(loan[4]),
-            "fine": money(loan[5]),
+            "fine": fines.money(loan[5]),
             "fine_paid": bool(loan[6]),
             "renewals": loan[7],
             "checked_out": loan[8],
-            "current_fine": money(current_fine),
+            "current_fine": fines.money(current_fine),
         }
     )
 
@@ -213,7 +207,7 @@ def create_loan():
     for loan in rows:
         if loan[4] == 0:
             open_loans += 1
-        owed += balance_owed(loan[3], loan[4], loan[5], loan[6])
+        owed += fines.balance_owed(loan[3], loan[4], loan[5], loan[6])
     if owed > 0:
         conn.close()
         return jsonify({"error": "member has unpaid fines"}), 409
@@ -246,7 +240,7 @@ def create_loan():
                 "member_id": loan[2],
                 "due_date": loan[3],
                 "returned": bool(loan[4]),
-                "fine": money(loan[5]),
+                "fine": fines.money(loan[5]),
                 "fine_paid": bool(loan[6]),
                 "renewals": loan[7],
                 "checked_out": loan[8],
@@ -267,7 +261,7 @@ def return_book(loan_id):
         conn.close()
         return jsonify({"error": "loan already returned"}), 409
 
-    fine = late_fine(loan[3])
+    fine = fines.late_fine(loan[3])
     conn.execute("UPDATE loans SET returned = 1, fine = ? WHERE id = ?", (fine, loan_id))
     conn.execute("UPDATE books SET available = 1 WHERE id = ?", (loan[1],))
     conn.commit()
@@ -279,7 +273,7 @@ def return_book(loan_id):
     with open("outbox.txt", "a") as f:
         f.write(
             "TO: " + member[2] + " | SUBJECT: Book returned | BODY: You returned " + book[1]
-            + ". Fine: $" + str(money(fine)) + "\n"
+            + ". Fine: $" + str(fines.money(fine)) + "\n"
         )
 
     return jsonify(
@@ -289,7 +283,7 @@ def return_book(loan_id):
             "member_id": updated[2],
             "due_date": updated[3],
             "returned": bool(updated[4]),
-            "fine": money(updated[5]),
+            "fine": fines.money(updated[5]),
             "fine_paid": bool(updated[6]),
             "renewals": updated[7],
             "checked_out": updated[8],
@@ -308,7 +302,7 @@ def renew_loan(loan_id):
     if loan[4] == 1:
         conn.close()
         return jsonify({"error": "loan already returned"}), 409
-    if date.fromisoformat(loan[3]) < date.today():
+    if fines.is_overdue(loan[3]):
         conn.close()
         return jsonify({"error": "overdue loans cannot be renewed"}), 409
     if loan[7] >= 1:
@@ -332,47 +326,7 @@ def renew_loan(loan_id):
             "member_id": updated[2],
             "due_date": updated[3],
             "returned": bool(updated[4]),
-            "fine": money(updated[5]),
-            "fine_paid": bool(updated[6]),
-            "renewals": updated[7],
-            "checked_out": updated[8],
-        }
-    )
-
-
-@app.route("/loans/<int:loan_id>/pay-fine", methods=["POST"])
-def pay_fine(loan_id):
-    conn = db.connect()
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    if loan is None:
-        conn.close()
-        return jsonify({"error": "loan not found"}), 404
-    if loan[4] == 0:
-        conn.close()
-        return jsonify({"error": "return the book before paying"}), 409
-    if loan[5] <= 0 or loan[6] == 1:
-        conn.close()
-        return jsonify({"error": "no fine to pay"}), 409
-
-    conn.execute("UPDATE loans SET fine_paid = 1 WHERE id = ?", (loan_id,))
-    conn.commit()
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
-    updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
-
-    with open("outbox.txt", "a") as f:
-        f.write(
-            "TO: " + member[2] + " | SUBJECT: Fine paid | BODY: We received $" + str(money(loan[5])) + "\n"
-        )
-
-    return jsonify(
-        {
-            "id": updated[0],
-            "book_id": updated[1],
-            "member_id": updated[2],
-            "due_date": updated[3],
-            "returned": bool(updated[4]),
-            "fine": money(updated[5]),
+            "fine": fines.money(updated[5]),
             "fine_paid": bool(updated[6]),
             "renewals": updated[7],
             "checked_out": updated[8],
@@ -399,14 +353,13 @@ def report_overdue():
     items = []
     total = 0
     for r in rows:
-        late = days_late(r[3])
-        if late > 0:
-            fine = late_fine(r[3])
+        if fines.is_overdue(r[3]):
+            fine = fines.late_fine(r[3])
             total += fine
             items.append(
-                {"loan_id": r[0], "title": r[1], "member": r[2], "days_late": late, "fine": money(fine)}
+                {"loan_id": r[0], "title": r[1], "member": r[2], "days_late": fines.days_late(r[3]), "fine": fines.money(fine)}
             )
-    return jsonify({"items": items, "total_fines": money(total)})
+    return jsonify({"items": items, "total_fines": fines.money(total)})
 
 
 @app.route("/reports/summary", methods=["GET"])
@@ -420,8 +373,8 @@ def report_summary():
     for loan in rows:
         if loan[4] == 0:
             on_loan += 1
-        outstanding += balance_owed(loan[3], loan[4], loan[5], loan[6])
-    return jsonify({"total_books": total_books, "on_loan": on_loan, "fines_outstanding": money(outstanding)})
+        outstanding += fines.balance_owed(loan[3], loan[4], loan[5], loan[6])
+    return jsonify({"total_books": total_books, "on_loan": on_loan, "fines_outstanding": fines.money(outstanding)})
 
 
 if not os.path.exists("library.db"):
